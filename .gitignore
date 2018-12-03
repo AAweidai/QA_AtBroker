@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 
 # C extensions
-*.so
+
 
 # Distribution / packaging
 .Python
@@ -105,3 +105,4 @@ venv.bak/
 
 
 ATPY
+test.py
