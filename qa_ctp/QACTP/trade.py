@@ -12,11 +12,11 @@ import time
 import os
 import platform
 
-from .enums import OrderType, InstrumentStatus
-from .structs import DirectType, InfoField, InstrumentField, OffsetType, OrderField, OrderStatus, PositionField, TradeField, TradingAccount
-from .ctp_trade import Trade
-from .ctp_struct import CThostFtdcInputOrderActionField, CThostFtdcInputOrderField, CThostFtdcInstrumentField, CThostFtdcInstrumentStatusField, CThostFtdcInvestorPositionField, CThostFtdcOrderField, CThostFtdcRspInfoField, CThostFtdcRspUserLoginField, CThostFtdcSettlementInfoConfirmField, CThostFtdcTradingAccountField
-from .ctp_enum import ActionFlagType, ContingentConditionType, DirectionType, OffsetFlagType, ForceCloseReasonType, HedgeFlagType, OrderPriceTypeType, PosiDirectionType, TimeConditionType, VolumeConditionType, OrderStatusType, InstrumentStatusType
+from QACTP.enums import OrderType, InstrumentStatus, DirectType, OffsetType, HedgeType, TradeTypeType
+from QACTP.structs import InfoField, InstrumentField, OrderField, OrderStatus, PositionField, TradeField, TradingAccount, PositionDetail
+from QACTP.ctp_trade import Trade
+from QACTP.ctp_struct import CThostFtdcInputOrderActionField, CThostFtdcInputOrderField, CThostFtdcInstrumentField, CThostFtdcInstrumentStatusField, CThostFtdcInvestorPositionField, CThostFtdcOrderField, CThostFtdcRspInfoField, CThostFtdcRspUserLoginField, CThostFtdcSettlementInfoConfirmField, CThostFtdcTradingAccountField, CThostFtdcTradingNoticeInfoField, CThostFtdcQuoteField, CThostFtdcInputQuoteField, CThostFtdcInputForQuoteField, CThostFtdcInvestorPositionDetailField, CThostFtdcRspAuthenticateField
+from QACTP.ctp_enum import TThostFtdcActionFlagType, TThostFtdcContingentConditionType, TThostFtdcDirectionType, TThostFtdcOffsetFlagType, TThostFtdcForceCloseReasonType, TThostFtdcHedgeFlagType, TThostFtdcOrderPriceTypeType, TThostFtdcPosiDirectionType, TThostFtdcTimeConditionType, TThostFtdcVolumeConditionType, TThostFtdcOrderStatusType, TThostFtdcInstrumentStatusType, TThostFtdcTradeTypeType, TThostFtdcAppTypeType
 
 
 class CtpTrade():
@@ -27,6 +27,10 @@ class CtpTrade():
         self.investor = ''
         self.password = ''
         self.broker = ''
+        self.pub_ip = ''
+        '''公网IP'''
+        self.port = ''
+        '''公网端口'''
         self.logined = False
         self.tradingday = ''
 
@@ -42,7 +46,7 @@ class CtpTrade():
         self._orderid_sysid = {}
         self._posi = []
 
-        self.t = Trade(os.path.join(os.path.abspath(os.path.dirname(__file__)), 'lib', 'ctp_trade.' + ('dll' if 'Windows' in platform.system() else 'so')))
+        self.t = Trade()
 
     def _OnFrontConnected(self):
         threading.Thread(target=self.OnConnected, args=(self,)).start()
@@ -54,7 +58,8 @@ class CtpTrade():
         if nReason == 4097 or nReason == 4098:
             threading.Thread(target=self._reconnect).start()
         else:
-            threading.Thread(target=self.OnDisConnected, args=(self, nReason)).start()
+            threading.Thread(target=self.OnDisConnected,
+                             args=(self, nReason)).start()
 
     def _reconnect(self):
         if sum([1 if stat == 'Continous' else 0 for exc, stat in self.instrument_status.items()]) == 0:
@@ -65,6 +70,23 @@ class CtpTrade():
 
     # def _OnRspUserLogout(self, pUserLogout: CThostFtdcUserLogoutField, pRspInfo: CThostFtdcRspInfoField, nRequestID: int, bIsLast: bool):
     #     pass
+
+    def _OnRspAuthenticate(self, pRspAuthenticateField: CThostFtdcRspAuthenticateField, pRspInfo: CThostFtdcRspInfoField, nRequestID: int, bIsLast: bool):
+        if pRspInfo.getErrorID() == 0:
+            if pRspAuthenticateField.getAppType() == TThostFtdcAppTypeType.THOST_FTDC_APP_TYPE_InvestorRelay:
+                self.t.RegisterUserSystemInfo(
+                    self.broker, self.investor, 0, '', self.pub_ip, self.port, time.strftime('%H:%M:%S', time.localtime()))
+            elif pRspAuthenticateField.getAppType() == TThostFtdcAppTypeType.THOST_FTDC_APP_TYPE_OperatorRelay:
+                self.t.SubmitUserSystemInfo(
+                    self.broker, self.investor, 0, '', self.pub_ip, self.port, time.strftime('%H:%M:%S', time.localtime()))
+            self.t.ReqUserLogin(BrokerID=self.broker, UserID=self.investor, Password=self.password,
+                                UserProductInfo=pRspAuthenticateField.getUserProductInfo())
+        else:
+            info = InfoField()
+            info.ErrorID = pRspInfo.getErrorID()
+            info.ErrorMsg = f'认证错误:{pRspInfo.getErrorMsg()}'
+            threading.Thread(target=self.OnUserLogin,
+                             args=(self, info)).start()
 
     def _OnRspUserLogin(self, pRspUserLogin: CThostFtdcRspUserLoginField(), pRspInfo: CThostFtdcRspInfoField, nRequestID: int, bIsLast: bool):
         """"""
@@ -78,7 +100,8 @@ class CtpTrade():
             info = InfoField()
             info.ErrorID = pRspInfo.getErrorID()
             info.ErrorMsg = pRspInfo.getErrorMsg()
-            threading.Thread(target=self.OnUserLogin, args=(self, info)).start()
+            threading.Thread(target=self.OnUserLogin,
+                             args=(self, info)).start()
 
     def _relogin(self):
         # 隔夜重连=>处理'初始化'错误
@@ -137,16 +160,17 @@ class CtpTrade():
         if pInstrumentStatus.getInstrumentID() == '':
             return
         status = InstrumentStatus.Continous
-        if pInstrumentStatus.getInstrumentStatus() == InstrumentStatusType.Continous:
+        if pInstrumentStatus.getInstrumentStatus() == TThostFtdcInstrumentStatusType.THOST_FTDC_IS_Continous:
             status = InstrumentStatus.Continous
-        elif pInstrumentStatus.getInstrumentStatus() == InstrumentStatusType.Closed:
+        elif pInstrumentStatus.getInstrumentStatus() == TThostFtdcInstrumentStatusType.THOST_FTDC_IS_Closed:
             status = InstrumentStatus.Closed
         elif str(pInstrumentStatus.getInstrumentStatus()).startswith('Auction'):
             status = InstrumentStatus.Auction
         else:
             status = InstrumentStatus.NoTrading
         self.instrument_status[pInstrumentStatus.getInstrumentID()] = status
-        self.OnInstrumentStatus(self, pInstrumentStatus.getInstrumentID(), status)
+        self.OnInstrumentStatus(
+            self, pInstrumentStatus.getInstrumentID(), status)
 
     def _OnRspQryInstrument(self, pInstrument: CThostFtdcInstrumentField, pRspInfo: CThostFtdcRspInfoField, nRequestID: int, bIsLast: bool):
         """"""
@@ -157,19 +181,22 @@ class CtpTrade():
         inst.VolumeMultiple = pInstrument.getVolumeMultiple()
         inst.PriceTick = pInstrument.getPriceTick()
         inst.MaxOrderVolume = pInstrument.getMaxLimitOrderVolume()
-        inst.ProductType = pInstrument.getProductClass().name  # ProductClassType.Futures -> Futures
+        # ProductClassType.Futures -> Futures
+        inst.ProductType = pInstrument.getProductClass().name
         self.instruments[inst.InstrumentID] = inst
 
     def _OnRspQryPosition(self, pInvestorPosition: CThostFtdcInvestorPositionField, pRspInfo: CThostFtdcRspInfoField, nRequestID: int, bIsLast: bool):
         """"""
         if pInvestorPosition.getInstrumentID() != '':  # 偶尔出现NULL的数据导致数据转换错误
-            self._posi.append(pInvestorPosition)  # Struct(**f.__dict__)) #dict -> object
+            # Struct(**f.__dict__)) #dict -> object
+            self._posi.append(pInvestorPosition)
 
         if bIsLast:
             # 先排序再group才有效
-            self._posi = sorted(self._posi, key=lambda c: '{0}_{1}'.format(c.getInstrumentID(), DirectType.Buy if c.getPosiDirection() == PosiDirectionType.Long else DirectType.Sell))
+            self._posi = sorted(self._posi, key=lambda c: '{0}_{1}'.format(c.getInstrumentID(
+            ), DirectType.Buy if c.getPosiDirection() == TThostFtdcPosiDirectionType.THOST_FTDC_PD_Long else DirectType.Sell))
             # direction需从posidiction转换为dictiontype
-            for key, group in itertools.groupby(self._posi, lambda c: '{0}_{1}'.format(c.getInstrumentID(), 'Buy' if c.getPosiDirection() == PosiDirectionType.Long else 'Sell')):
+            for key, group in itertools.groupby(self._posi, lambda c: '{0}_{1}'.format(c.getInstrumentID(), 'Buy' if c.getPosiDirection() == TThostFtdcPosiDirectionType.THOST_FTDC_PD_Long else 'Sell')):
                 pf = self.positions.get(key)
                 if not pf:
                     pf = PositionField()
@@ -186,7 +213,8 @@ class CtpTrade():
                 for g in group:
                     if not pf.InstrumentID:
                         pf.InstrumentID = g.getInstrumentID()
-                        pf.Direction = DirectType.Buy if g.getPosiDirection() == PosiDirectionType.Long else DirectType.Sell
+                        pf.Direction = DirectType.Buy if g.getPosiDirection(
+                        ) == TThostFtdcPosiDirectionType.THOST_FTDC_PD_Long else DirectType.Sell
                     pf.Position += g.getPosition()
                     pf.TdPosition += g.getTodayPosition()
                     pf.YdPosition = pf.Position - pf.TdPosition
@@ -196,9 +224,30 @@ class CtpTrade():
                     pf.Margin += g.getUseMargin()
                     cost += g.OpenCost
                 # pf.Position <= 0 ? 0 : (g.Sum(n => n.PositionCost) / DicInstrumentField[pf.InstrumentID].VolumeMultiple / pf.Position);
-                vm = self.instruments[pf.InstrumentID].VolumeMultiple
-                pf.Price = 0 if pf.Position <= 0 else cost / vm / pf.Position
+                if pf.InstrumentID in self.instruments:
+                    vm = self.instruments[pf.InstrumentID].VolumeMultiple
+                    pf.Price = 0 if pf.Position <= 0 else (
+                        cost / (vm if vm > 0 else 1) / pf.Position)
             self._posi.clear()
+
+    def _OnRspQryPositionDetail(self, pInvestorPositionDetail: CThostFtdcInvestorPositionDetailField, pRspInfo: CThostFtdcRspInfoField, nRequestID: int, bIsLast: bool):
+        """持仓明细"""
+        if pInvestorPositionDetail.getInstrumentID() == '':
+            return
+        detail = PositionDetail()
+        detail.Instrument = pInvestorPositionDetail.getInstrumentID()
+        detail.CloseProfit = pInvestorPositionDetail.getCloseProfitByTrade()
+        detail.Direction = DirectType.Buy if pInvestorPositionDetail.getDirection(
+        ) == TThostFtdcDirectionType.THOST_FTDC_D_Buy else DirectType.Sell
+        detail.HedgeFlag = HedgeType(list(TThostFtdcHedgeFlagType).index(
+            pInvestorPositionDetail.getHedgeFlag()))
+        detail.OpenDate = pInvestorPositionDetail.getOpenDate()
+        detail.PositionProfit = pInvestorPositionDetail.getPositionProfitByTrade()
+        detail.OpenPrice = pInvestorPositionDetail.getOpenPrice()
+        detail.TradeType = TradeTypeType(list(TThostFtdcTradeTypeType).index(
+            pInvestorPositionDetail.getTradeType()))
+        detail.Volume = pInvestorPositionDetail.getVolume()
+        self.position_details[pInvestorPositionDetail.getTradeID()] = detail
 
     def _OnRspQryAccount(self, pTradingAccount: CThostFtdcTradingAccountField, pRspInfo: CThostFtdcRspInfoField, nRequestID: int, bIsLast: bool):
         """"""
@@ -210,13 +259,17 @@ class CtpTrade():
         self.account.CurrMargin = pTradingAccount.getCurrMargin()
         self.account.FrozenCash = pTradingAccount.getFrozenCash()
         self.account.PositionProfit = pTradingAccount.getPositionProfit()
-        self.account.PreBalance = pTradingAccount.getPreBalance() + pTradingAccount.getDeposit() + pTradingAccount.getWithdraw()
-        self.account.Fund = self.account.PreBalance + pTradingAccount.getCloseProfit() + pTradingAccount.getPositionProfit() - pTradingAccount.getCommission()
-        self.account.Risk = 0 if self.account.Fund == 0 else self.account.CurrMargin / self.account.Fund
+        self.account.PreBalance = pTradingAccount.getPreBalance(
+        ) + pTradingAccount.getDeposit() + pTradingAccount.getWithdraw()
+        self.account.Fund = self.account.PreBalance + pTradingAccount.getCloseProfit() + \
+            pTradingAccount.getPositionProfit() - pTradingAccount.getCommission()
+        self.account.Risk = 0 if self.account.Fund == 0 else self.account.CurrMargin / \
+            self.account.Fund
 
     def _OnRtnOrder(self, pOrder: CThostFtdcOrderField):
         """"""
-        id = '{0}|{1}|{2}'.format(pOrder.getSessionID(), pOrder.getFrontID(), pOrder.getOrderRef())
+        id = '{0}|{1}|{2}'.format(pOrder.getSessionID(
+        ), pOrder.getFrontID(), pOrder.getOrderRef())
         of = self.orders.get(id)
         if not of:
             of = OrderField()
@@ -224,13 +277,10 @@ class CtpTrade():
                 of.Custom = int(pOrder.getOrderRef()) % 1000000
             of.InstrumentID = pOrder.getInstrumentID()
             of.InsertTime = pOrder.getInsertTime()
-            of.Direction = DirectType.Buy if DirectionType(
-                pOrder.getDirection()
-            ) == DirectionType.Buy else DirectType.Sell
-            ot = OffsetFlagType(ord(pOrder.getCombOffsetFlag()[0]))
-            of.Offset = OffsetType.Open if ot == OffsetFlagType.Open else (
-                OffsetType.CloseToday
-                if ot == OffsetFlagType.CloseToday else OffsetType.Close)
+            of.Direction = DirectType.Buy if pOrder.getDirection(
+            ) == TThostFtdcDirectionType.THOST_FTDC_D_Buy else DirectType.Sell
+            ot = TThostFtdcOffsetFlagType(ord(pOrder.getCombOffsetFlag()[0]))
+            of.Offset = OffsetType.Open if ot == TThostFtdcOffsetFlagType.THOST_FTDC_OF_Open else OffsetType.CloseToday if ot == TThostFtdcOffsetFlagType.THOST_FTDC_OF_CloseToday else OffsetType.Close
             of.Status = OrderStatus.Normal
             of.StatusMsg = pOrder.getStatusMsg()
             of.IsLocal = pOrder.getSessionID() == self.session
@@ -240,7 +290,7 @@ class CtpTrade():
             of.VolumeLeft = of.Volume
             self.orders[id] = of
             threading.Thread(target=self.OnOrder, args=(self, of)).start()
-        elif pOrder.getOrderStatus() == OrderStatusType.Canceled:
+        elif pOrder.getOrderStatus() == TThostFtdcOrderStatusType.THOST_FTDC_OST_Canceled:
             of.Status = OrderStatus.Canceled
             of.StatusMsg = pOrder.getStatusMsg()
 
@@ -248,22 +298,25 @@ class CtpTrade():
                 info = InfoField()
                 info.ErrorID = -1
                 info.ErrorMsg = of.StatusMsg
-                threading.Thread(target=self.OnErrOrder, args=(self, of, info)).start()
+                threading.Thread(target=self.OnErrOrder,
+                                 args=(self, of, info)).start()
             else:
                 threading.Thread(target=self.OnCancel, args=(self, of)).start()
         else:
             if pOrder.getOrderSysID():
                 of.SysID = pOrder.getOrderSysID()
-                self._orderid_sysid[pOrder.getOrderSysID()] = id  # 记录sysid与orderid关联,方便Trade时查找处理
+                # 记录sysid与orderid关联,方便Trade时查找处理
+                self._orderid_sysid[pOrder.getOrderSysID()] = id
 
     def _OnRtnTrade(self, f):
         """"""
         tf = TradeField()
-        tf.Direction = DirectType.Buy if f.getDirection() == DirectionType.Buy else DirectType.Sell
+        tf.Direction = DirectType.Buy if f.getDirection(
+        ) == TThostFtdcDirectionType.THOST_FTDC_D_Buy else DirectType.Sell
         tf.ExchangeID = f.getExchangeID()
         tf.InstrumentID = f.getInstrumentID()
-        tf.Offset = OffsetType.Open if f.getOffsetFlag() == OffsetFlagType.Open else OffsetType.Close if f.getOffsetFlag(
-        ) == OffsetFlagType.Close else OffsetType.CloseToday
+        tf.Offset = OffsetType.Open if f.getOffsetFlag() == TThostFtdcOffsetFlagType.THOST_FTDC_OF_Open else OffsetType.Close if f.getOffsetFlag(
+        ) == TThostFtdcOffsetFlagType.THOST_FTDC_OF_Close else OffsetType.CloseToday
         tf.Price = f.getPrice()
         tf.SysID = f.getOrderSysID()
         tf.TradeID = f.getTradeID()
@@ -289,18 +342,21 @@ class CtpTrade():
             of.StatusMsg = '部分成交'
         # 更新持仓 *****
         if tf.Offset == OffsetType.Open:
-            key = '{0}_{1}'.format(tf.InstrumentID, 'Buy' if tf.Direction == DirectType.Buy else 'Sell')
+            key = '{0}_{1}'.format(
+                tf.InstrumentID, 'Buy' if tf.Direction == DirectType.Buy else 'Sell')
             pf = self.positions.get(key)
             if not pf:
                 pf = PositionField()
                 self.positions[key] = pf
             pf.InstrumentID = tf.InstrumentID
             pf.Direction = tf.Direction
-            pf.Price = (pf.Price * pf.Position + tf.Price * tf.Volume) / (pf.Position + tf.Volume)
+            pf.Price = (pf.Price * pf.Position + tf.Price *
+                        tf.Volume) / (pf.Position + tf.Volume)
             pf.TdPosition += tf.Volume
             pf.Position += tf.Volume
         else:
-            key = '{0}_{1}'.format(tf.InstrumentID, DirectType.Sell if tf.Direction == DirectType.Buy else DirectType.Buy)
+            key = '{0}_{1}'.format(
+                tf.InstrumentID, DirectType.Sell if tf.Direction == DirectType.Buy else DirectType.Buy)
             pf = self.positions.get(key)
             if pf:  # 有可能出现无持仓的情况
                 if tf.Offset == OffsetType.CloseToday:
@@ -332,9 +388,11 @@ class CtpTrade():
             of.InstrumentID = pInputOrder.getInstrumentID()
             of.InsertTime = time.strftime('%H:%M:%S', time.localtime())
             # 对direction需特别处理（具体见ctp_struct）
-            of.Direction = DirectType.Buy if DirectionType(pInputOrder.getDirection()) == DirectionType.Buy else DirectType.Sell
-            ot = OffsetFlagType(ord(pInputOrder.getCombOffsetFlag()[0]))
-            of.Offset = OffsetType.Open if ot == OffsetFlagType.Open else (OffsetType.CloseToday if ot == OffsetFlagType.CloseToday else OffsetType.Close)
+            of.Direction = DirectType.Buy if pInputOrder.getDirection(
+            ) == TThostFtdcDirectionType.THOST_FTDC_D_Buy else DirectType.Sell
+            ot = TThostFtdcOffsetFlagType(
+                ord(pInputOrder.getCombOffsetFlag()[0]))
+            of.Offset = OffsetType.Open if ot == TThostFtdcOffsetFlagType.THOST_FTDC_OF_Open else OffsetType.CloseToday if ot == TThostFtdcOffsetFlagType.THOST_FTDC_OF_CloseToday else OffsetType.Close
             # of.Status = OrderStatus.Normal
             # of.StatusMsg = f.getStatusMsg()
             of.IsLocal = True
@@ -359,22 +417,49 @@ class CtpTrade():
 
         if of and of.IsLocal:
             of.Status = OrderStatus.Error
-            of.StatusMsg = '{0}:{1}'.format(pRspInfo.getErrorID(), pRspInfo.getErrorMsg())
-            threading.Thread(target=self.OnErrOrder, args=(self, of, info)).start()
+            of.StatusMsg = '{0}:{1}'.format(
+                pRspInfo.getErrorID(), pRspInfo.getErrorMsg())
+            threading.Thread(target=self.OnErrOrder,
+                             args=(self, of, info)).start()
 
     def _OnRspOrderAction(self, pInputOrderAction: CThostFtdcInputOrderActionField, pRspInfo: CThostFtdcRspInfoField, nRequestID: int, bIsLast: bool):
-        id = "{0}|{1}|{2}".format(pInputOrderAction.getSessionID(), pInputOrderAction.getFrontID(), pInputOrderAction.getOrderRef())
+        id = "{0}|{1}|{2}".format(pInputOrderAction.getSessionID(
+        ), pInputOrderAction.getFrontID(), pInputOrderAction.getOrderRef())
         if self.logined and id in self.orders:
             info = InfoField()
             info.ErrorID = pRspInfo.ErrorID
             info.ErrorMsg = pRspInfo.ErrorMsg
-            threading.Thread(target=self.OnErrCancel, args=(self, self.orders[id], info)).start()
+            threading.Thread(target=self.OnErrCancel, args=(
+                self, self.orders[id], info)).start()
+
+    def _OnRtnNotice(self, pTradingNoticeInfo: CThostFtdcTradingNoticeInfoField):
+        '''交易提醒'''
+        msg = pTradingNoticeInfo.getFieldContent()
+        if len(msg) > 0:
+            threading.Thread(target=self.OnRtnNotice, args=(
+                self, pTradingNoticeInfo.getSendTime(), msg)).start()
+
+    def _OnRtnQuote(self, pQuote: CThostFtdcQuoteField):
+        threading.Thread(target=self.OnRtnQuote, args=(self, pQuote)).start()
+
+    def _OnErrRtnQuote(self, pInputQuote: CThostFtdcInputQuoteField, pRspInfo: CThostFtdcRspInfoField):
+        info = InfoField()
+        info.ErrorID = pRspInfo.getErrorID()
+        info.ErrorMsg = pRspInfo.getErrorMsg()
+        threading.Thread(target=self.OnErrRtnQuote,
+                         args=(self, pInputQuote, info)).start()
+
+    def _OnErrForQuoteInsert(self, pInputForQuote: CThostFtdcInputForQuoteField, pRspInfo: CThostFtdcRspInfoField):
+        info = InfoField()
+        info.ErrorID = pRspInfo.getErrorID()
+        info.ErrorMsg = pRspInfo.getErrorMsg()
+        threading.Thread(target=self.OnErrRtnForQuoteInsert,
+                         args=(self, pInputForQuote, info)).start()
 
     def ReqConnect(self, front: str):
-        """
-        连接交易前置
-            :param self:
-            :param front:str:
+        """连接交易前置
+
+        :param front:
         """
         self.t.CreateApi()
         spi = self.t.CreateSpi()
@@ -382,6 +467,7 @@ class CtpTrade():
 
         self.t.OnFrontConnected = self._OnFrontConnected
         self.t.OnRspUserLogin = self._OnRspUserLogin
+        self.t.OnRspAuthenticate = self._OnRspAuthenticate
         self.t.OnFrontDisconnected = self._OnFrontDisconnected
         # self.t.OnRspUserLogout = self._OnRspUserLogout
         self.t.OnRspSettlementInfoConfirm = self._OnRspSettlementInfoConfirm
@@ -394,6 +480,11 @@ class CtpTrade():
         self.t.OnRspQryInstrument = self._OnRspQryInstrument
         self.t.OnRspQryTradingAccount = self._OnRspQryAccount
         self.t.OnRspQryInvestorPosition = self._OnRspQryPosition
+        self.t.OnRspQryInvestorPositionDetail = self._OnRspQryPositionDetail
+        self.t.OnRtnTradingNotice = self._OnRtnNotice
+        self.t.OnRtnQuote = self._OnRtnQuote
+        self.t.OnErrRtnQuoteInsert = self._OnErrRtnQuote
+        self.t.OnErrRtnForQuoteInsert = self._OnErrForQuoteInsert
 
         self.front_address = front
         self.t.RegCB()
@@ -403,55 +494,55 @@ class CtpTrade():
         self.t.Init()
         # self.t.Join()
 
-    def ReqUserLogin(self, user: str, pwd: str, broker: str):
-        """
-        登录
-            :param self:
-            :param user:str:
-            :param pwd:str:
-            :param broker:str:
+    def ReqUserLogin(self, user: str, pwd: str, broker: str, proc_info: str, appid: str, auth_code: str):
+        """登录
+
+        :param user:
+        :param pwd:
+        :param broker:
         """
         self.broker = broker
         self.investor = user
         self.password = pwd
-        self.t.ReqUserLogin(BrokerID=broker, UserID=user, Password=pwd)
+        self.t.ReqAuthenticate(broker, user, proc_info, auth_code, appid)
 
     def ReqOrderInsert(self, pInstrument: str, pDirection: DirectType, pOffset: OffsetType, pPrice: float = 0.0, pVolume: int = 1, pType: OrderType = OrderType.Limit, pCustom: int = 0):
+        """委托
+
+        :param pInstrument:
+        :param pDirection:
+        :param pOffset:
+        :param pPrice:
+        :param pVolume:
+        :param pType:
+        :param pCustom:
+        :return:
         """
-        委托
-            :param self:
-            :param pInstrument:str:
-            :param pDirection:DirectType:
-            :param pOffset:OffsetType:
-            :param pPrice:float=0.0:
-            :param pVolume:int=1:
-            :param pType:OrderType=OrderType.Limit:
-        """
-        OrderPriceType = OrderPriceTypeType.AnyPrice
-        TimeCondition = TimeConditionType.IOC
+        OrderPriceType = TThostFtdcOrderPriceTypeType.THOST_FTDC_OPT_AnyPrice
+        TimeCondition = TThostFtdcTimeConditionType.THOST_FTDC_TC_IOC
         LimitPrice = 0.0
-        VolumeCondition = VolumeConditionType.AV
+        VolumeCondition = TThostFtdcVolumeConditionType.THOST_FTDC_VC_AV
 
         if pType == OrderType.Market:  # 市价
-            OrderPriceType = OrderPriceTypeType.AnyPrice
-            TimeCondition = TimeConditionType.IOC
+            OrderPriceType = TThostFtdcOrderPriceTypeType.THOST_FTDC_OPT_AnyPrice
+            TimeCondition = TThostFtdcTimeConditionType.THOST_FTDC_TC_IOC
             LimitPrice = 0.0
-            VolumeCondition = VolumeConditionType.AV
+            VolumeCondition = TThostFtdcVolumeConditionType.THOST_FTDC_VC_AV
         elif pType == OrderType.Limit:  # 限价
-            OrderPriceType = OrderPriceTypeType.LimitPrice
-            TimeCondition = TimeConditionType.GFD
+            OrderPriceType = TThostFtdcOrderPriceTypeType.THOST_FTDC_OPT_LimitPrice
+            TimeCondition = TThostFtdcTimeConditionType.THOST_FTDC_TC_GFD
             LimitPrice = pPrice
-            VolumeCondition = VolumeConditionType.AV
+            VolumeCondition = TThostFtdcVolumeConditionType.THOST_FTDC_VC_AV
         elif pType == OrderType.FAK:  # FAK
-            OrderPriceType = OrderPriceTypeType.LimitPrice
-            TimeCondition = TimeConditionType.IOC
+            OrderPriceType = TThostFtdcOrderPriceTypeType.THOST_FTDC_OPT_LimitPrice
+            TimeCondition = TThostFtdcTimeConditionType.THOST_FTDC_TC_IOC
             LimitPrice = pPrice
-            VolumeCondition = VolumeConditionType.AV
+            VolumeCondition = TThostFtdcVolumeConditionType.THOST_FTDC_VC_AV
         elif pType == OrderType.FOK:  # FOK
-            OrderPriceType = OrderPriceTypeType.LimitPrice
-            TimeCondition = TimeConditionType.IOC
+            OrderPriceType = TThostFtdcOrderPriceTypeType.THOST_FTDC_OPT_LimitPrice
+            TimeCondition = TThostFtdcTimeConditionType.THOST_FTDC_TC_IOC
             LimitPrice = pPrice
-            VolumeCondition = VolumeConditionType.CV  # 全部数量
+            VolumeCondition = TThostFtdcVolumeConditionType.THOST_FTDC_VC_CV  # 全部数量
 
         self._req += 1
         self.t.ReqOrderInsert(
@@ -461,14 +552,15 @@ class CtpTrade():
             OrderRef="%06d%06d" % (self._req, pCustom % 1000000),
             UserID=self.investor,
             # 此处ctp_enum与at_struct名称冲突
-            Direction=DirectionType.Buy
-            if pDirection == DirectType.Buy else DirectionType.Sell,
-            CombOffsetFlag=chr(OffsetFlagType.Open if pOffset == OffsetType.Open else (OffsetFlagType.CloseToday if pOffset == OffsetType.CloseToday else OffsetFlagType.Close)),
-            CombHedgeFlag=HedgeFlagType.Speculation.__char__(),
+            Direction=TThostFtdcDirectionType.THOST_FTDC_D_Buy if pDirection == DirectType.Buy else TThostFtdcDirectionType.THOST_FTDC_D_Sell,
+            CombOffsetFlag=chr(TThostFtdcOffsetFlagType.THOST_FTDC_OF_Open.value if pOffset == OffsetType.Open else TThostFtdcOffsetFlagType.THOST_FTDC_OF_CloseToday.value if pOffset ==
+                               OffsetType.CloseToday else TThostFtdcOffsetFlagType.THOST_FTDC_OF_Close.value),
+            CombHedgeFlag=chr(
+                TThostFtdcHedgeFlagType.THOST_FTDC_HF_Speculation.value),
             IsAutoSuspend=0,
-            ForceCloseReason=ForceCloseReasonType.NotForceClose,
+            ForceCloseReason=TThostFtdcForceCloseReasonType.THOST_FTDC_FCC_NotForceClose,
             IsSwapOrder=0,
-            ContingentCondition=ContingentConditionType.Immediately,
+            ContingentCondition=TThostFtdcContingentConditionType.THOST_FTDC_CC_Immediately,
             VolumeCondition=VolumeCondition,
             MinVolume=1,
             VolumeTotalOriginal=pVolume,
@@ -478,10 +570,9 @@ class CtpTrade():
         )
 
     def ReqOrderAction(self, OrderID: str):
-        """
-        撤单
-            :param self:
-            :param OrderID:str:
+        """撤单
+
+        :param OrderID:
         """
         of = self.orders[OrderID]
 
@@ -496,13 +587,10 @@ class CtpTrade():
                 FrontID=int(pOrderId.split('|')[1]),
                 SessionID=int(pOrderId.split('|')[0]),
                 InstrumentID=of.InstrumentID,
-                ActionFlag=ActionFlagType.Delete)
+                ActionFlag=TThostFtdcActionFlagType.THOST_FTDC_AF_Delete)
 
     def ReqUserLogout(self):
-        """
-        退出接口
-            :param self:
-        """
+        """退出接口"""
         self.logined = False
         time.sleep(3)
         self.t.ReqUserLogout(BrokerID=self.broker, UserID=self.investor)
@@ -511,48 +599,43 @@ class CtpTrade():
         threading.Thread(target=self.OnDisConnected, args=(self, 0)).start()
 
     def OnConnected(self, obj):
+        """接口连接
+
+        :param obj:
         """
-        接口连接
-            :param self:
-            :param obj:
-        """
-        print('=== OnConnected ==='.format(''))
+        print('=== [TRADE] OnConnected ==='.format(''))
 
     def OnDisConnected(self, obj, reason: int):
+        """接口断开
+
+        :param obj:
+        :param reason:
         """
-        接口断开
-            :param self:
-            :param obj:
-            :param reason:int:
-        """
-        print('=== OnDisConnected === \n{0}'.format(reason))
+        print('=== [TRADE] OnDisConnected === \nreason: {0}'.format(reason))
 
     def OnUserLogin(self, obj, info: InfoField):
+        """登录响应
+
+        :param obj:
+        :param info:
         """
-        登录响应
-            :param self:
-            :param obj:
-            :param info:InfoField:
-        """
-        print('=== OnUserLogin === \n{0}'.format(info))
+        print('=== [TRADE] OnUserLogin === \n{0}'.format(info))
 
     def OnOrder(self, obj, f: OrderField):
+        """委托响应
+
+        :param obj:
+        :param f:
         """
-        委托响应
-            :param self:
-            :param obj:
-            :param f:OrderField:
-        """
-        print('=== OnOrder === \n{0}'.format(f.__dict__))
+        print('=== [TRADE] OnOrder === \n{0}'.format(f.__dict__))
 
     def OnTrade(self, obj, f: TradeField):
+        """成交响应
+
+        :param obj:
+        :param f:
         """
-        成交响应
-            :param self:
-            :param obj:
-            :param f:TradeField:
-        """
-        print('=== OnTrade === \n{0}'.format(f.__dict__))
+        print('=== [TRADE] OnTrade === \n{0}'.format(f.__dict__))
 
     def OnCancel(self, obj, f: OrderField):
         """
@@ -561,7 +644,7 @@ class CtpTrade():
             :param obj:
             :param f:OrderField:
         """
-        print('=== OnCancel === \n{0}'.format(f.__dict__))
+        print('=== [TRADE] OnCancel === \n{0}'.format(f.__dict__))
 
     def OnErrCancel(self, obj, f: OrderField, info: InfoField):
         """
@@ -571,7 +654,7 @@ class CtpTrade():
             :param f:OrderField:
             :param info:InfoField:
         """
-        print('=== OnErrCancel ===\n{0}'.format(f.__dict__))
+        print('=== [TRADE] OnErrCancel ===\n{0}'.format(f.__dict__))
         print(info)
 
     def OnErrOrder(self, obj, f: OrderField, info: InfoField):
@@ -582,7 +665,7 @@ class CtpTrade():
             :param f:OrderField:
             :param info:InfoField:
         """
-        print('=== OnErrOrder ===\n{0}'.format(f.__dict__))
+        print('=== [TRADE] OnErrOrder ===\n{0}'.format(f.__dict__))
         print(info)
 
     def OnInstrumentStatus(self, obj, inst: str, status: InstrumentStatus):
@@ -593,4 +676,44 @@ class CtpTrade():
             :param inst:str:
             :param status:InstrumentStatus:
         """
-        print('{}:{}'.format(inst, str(status).strip().split('.')[1]))
+        print('{}:{}'.format(inst, str(status).strip().split('.')[-1]))
+
+    def OnRtnNotice(self, obj, time: str, msg: str):
+        """交易提醒
+
+        :param obj:
+        :param time:
+        :param msg:
+        :return:
+        """
+        print(f'=== OnRtnNotice===\n {time}:{msg}')
+
+    def OnRtnQuote(self, obj, quote: CThostFtdcQuoteField):
+        """报价通知
+
+        :param obj:
+        :param quote:
+        :return:
+        """
+        print('=== [TRADE] OnRtnQuote ===\n{0}'.format(quote.__dict__))
+
+    def OnErrRtnQuote(self, obj, quote: CThostFtdcInputQuoteField, info: InfoField):
+        """
+
+        :param obj:
+        :param quote:
+        :return:
+        """
+        print('=== [TRADE] OnErrRtnQuote ===\n{0}'.format(quote.__dict__))
+        print(info)
+
+    def OnErrRtnForQuoteInsert(self, obj, quote: CThostFtdcInputQuoteField, info: InfoField):
+        """询价录入错误回报
+
+        :param obj:
+        :param quote:
+        :return:
+        """
+        print('=== [TRADE] OnErrRtnForQuoteInsert ===\n{0}'.format(
+            quote.__dict__))
+        print(info)
